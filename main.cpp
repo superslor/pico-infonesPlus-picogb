@@ -62,12 +62,19 @@ static uint8_t framesbeforeAutoStateIsLoaded = 0;
 #endif
 
 #if USE_ST7789
-// The NES APU mix is very low level (≈0..2445 of 32767); scale it toward full
-// scale for the external I2S DAC. Tune to taste (4 ≈ 30% FS).
-// Output gain for the I2S DAC on the ST7789/PicoGB build. The NES APU mix is low
-// level; multiply it up toward 16-bit range (clamped). 12 clipped/too loud, 6 is
-// a comfortable level — tune here if needed.
-#define ST7789_AUDIO_GAIN 1
+// Output gain for the I2S DAC on the ST7789/PicoGB build. The NES APU mix is very
+// low level (≈0..2445 of 32767), so this multiplies it toward full scale (clamped).
+// Runtime-adjustable in-game with SELECT+LEFT/RIGHT (see InfoNES_PadState); 0 = mute.
+// Stored in settings.audioGain (persisted to the SD settings file) so it survives
+// reboots / game changes. Default 1 (a comfortable level).
+#define ST7789_AUDIO_GAIN_MIN 0
+#define ST7789_AUDIO_GAIN_MAX 6
+// Frames to keep the on-screen volume indicator visible after a change, and a
+// debounce so we write the settings file only once after adjustment settles.
+#define ST7789_VOL_OSD_FRAMES   90
+#define ST7789_VOL_SAVE_FRAMES  60
+static int g_volOsdFrames = 0;     // >0 => draw the indicator (counts down per frame)
+static int g_volSaveCountdown = 0; // >0 => save settings when it reaches 0
 #endif
 
 // DVI Gain (Q8). 256 = 1.0x, 384 = 1.5x, 512 = 2.0x
@@ -515,6 +522,18 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
                 scaleMode8_7_ = Frens::screenMode(+1);
             } else if (pushed & LEFT)
             {
+#if USE_ST7789
+                // SELECT+LEFT = volume down (step 1). On this build there is no DVI
+                // audio path, so the audio-output toggle used here on other boards
+                // would just silence the panel — repurpose it for the I2S gain.
+                if (i == 0 && settings.audioGain > ST7789_AUDIO_GAIN_MIN)
+                {
+                    settings.audioGain--;
+                    g_volOsdFrames = ST7789_VOL_OSD_FRAMES;
+                    g_volSaveCountdown = ST7789_VOL_SAVE_FRAMES;
+                    printf("Audio gain: %d\n", settings.audioGain);
+                }
+#else
                 // Toggle audio output, ignore if HSTX is enabled, because HSTX must use external audio
 #if EXT_AUDIO_IS_ENABLED && !HSTX
                 settings.flags.useExtAudio = !settings.flags.useExtAudio;
@@ -531,8 +550,21 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
                 settings.flags.useExtAudio = 0;
 #endif
                 //FrensSettings::savesettings();
+#endif // USE_ST7789
             }
-#if ENABLE_VU_METER
+#if USE_ST7789
+            else if (pushed & RIGHT)
+            {
+                // SELECT+RIGHT = volume up (step 1).
+                if (i == 0 && settings.audioGain < ST7789_AUDIO_GAIN_MAX)
+                {
+                    settings.audioGain++;
+                    g_volOsdFrames = ST7789_VOL_OSD_FRAMES;
+                    g_volSaveCountdown = ST7789_VOL_SAVE_FRAMES;
+                    printf("Audio gain: %d\n", settings.audioGain);
+                }
+            }
+#elif ENABLE_VU_METER
             else if (pushed & RIGHT)
             {
                 settings.flags.enableVUMeter = !settings.flags.enableVUMeter;
@@ -862,8 +894,8 @@ void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wa
             // The NES APU mix is very low level (≈0..2445 of 32767). Scale it up
             // toward full 16-bit range so it isn't buried in DAC/amp noise. Clamp.
             {
-                int gl = l * ST7789_AUDIO_GAIN; if (gl > 32767) gl = 32767;
-                int gr = r * ST7789_AUDIO_GAIN; if (gr > 32767) gr = 32767;
+                int gl = l * settings.audioGain; if (gl > 32767) gl = 32767;
+                int gr = r * settings.audioGain; if (gr > 32767) gr = 32767;
                 EXT_AUDIO_ENQUEUE_SAMPLE(gl, gr);
             }
 #else
@@ -1038,6 +1070,14 @@ int InfoNES_LoadFrame()
         else if (now > deadline + 50000)
             deadline = time_us_64();
     }
+
+    // Volume control housekeeping (once per frame): fade out the on-screen
+    // indicator, and persist a changed gain to the settings file once the user
+    // has stopped adjusting (debounced, so we don't write the SD every press).
+    if (g_volOsdFrames > 0)
+        g_volOsdFrames--;
+    if (g_volSaveCountdown > 0 && --g_volSaveCountdown == 0)
+        FrensSettings::savesettings();
 #endif
 //      if (pendingLoadState) {         // perform at frame start
 //         pendingLoadState = false;
@@ -1476,6 +1516,31 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
         }
     }
 
+#if USE_ST7789
+    // Volume OSD: for a short while after a SELECT+LEFT/RIGHT change, draw "VOL n"
+    // near the top of the picture (8x8 font, one 8px-tall band at rows 16..23).
+    // Written here in RGB555 (NesPalette) so st7789_convert_game_line below turns
+    // it into RGB565 along with the rest of the scanline.
+    if (g_volOsdFrames > 0 && line >= 16 && line < 24)
+    {
+        char volStr[12];
+        int n = snprintf(volStr, sizeof(volStr), "VOL %d", settings.audioGain);
+        WORD fgc = NesPalette[48];
+        WORD bgc = NesPalette[15];
+        WORD *p = currentLineBuffer_ + 40; // start column 40 (inside the NES area)
+        int rowInChar = line % 8;
+        for (int i = 0; i < n; i++)
+        {
+            char slice = getcharslicefrom8x8font(volStr[i], rowInChar);
+            for (int bit = 0; bit < 8; bit++)
+            {
+                *p++ = (slice & 1) ? fgc : bgc;
+                slice >>= 1;
+            }
+        }
+    }
+#endif
+
 #if !HSTX
 #if FRAMEBUFFERISPOSSIBLE
     if (!Frens::isFrameBufferUsed())
@@ -1608,6 +1673,10 @@ int main()
     // This hardware has no DVI/HDMI audio path — always route sound to the I2S DAC,
     // overriding any external-audio setting loaded from the SD card's settings file.
     settings.flags.useExtAudio = 1;
+    // Clamp a persisted gain into the valid range (e.g. if the ceiling was lowered
+    // since the value was saved) so the loaded volume can never exceed the maximum.
+    if (settings.audioGain > ST7789_AUDIO_GAIN_MAX)
+        settings.audioGain = ST7789_AUDIO_GAIN_MAX;
 #endif
 
     scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
