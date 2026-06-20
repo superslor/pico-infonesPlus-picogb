@@ -26,6 +26,10 @@
 #include "pico/bootrom.h"
 #include "InfoNES_FDS.h"
 #include "InfoNES_NSF.h"
+#if USE_ST7789
+#include "st7789.h"
+#include "gpio_buttons.h"
+#endif
 #if EMBEDDED_NES_ROM
 extern "C" const unsigned char embedded_nes_rom[];
 extern "C" const unsigned int embedded_nes_rom_len;
@@ -39,13 +43,31 @@ SaveStateTypes quickSaveAction = SaveStateTypes::NONE;
 static uint32_t start_tick_us = 0;
 static uint32_t fps = 0;
 static uint8_t framesbeforeAutoStateIsLoaded = 0;
+#if USE_ST7789
+// 280 MHz on the PicoGB build: faster emulation AND SPI0 = clk_peri/4 = 70 MHz
+// (vs 63 MHz at 252), ~11% more display bandwidth so core1 stays under the
+// 16.67 ms/frame budget and the I2S audio never underruns. VREG already 1.20V.
+#define EMULATOR_CLOCKFREQ_KHZ 280000 //  Overclock frequency in kHz when using Emulator
+#else
 #define EMULATOR_CLOCKFREQ_KHZ 252000 //  Overclock frequency in kHz when using Emulator
+#endif
 
 // Note: When using framebuffer, AUDIOBUFFERSIZE must be increased to 1024
 #if PICO_RP2350
 #define AUDIOBUFFERSIZE 1024
+#elif USE_ST7789
+#define AUDIOBUFFERSIZE 1024
 #else
 #define AUDIOBUFFERSIZE 256
+#endif
+
+#if USE_ST7789
+// The NES APU mix is very low level (≈0..2445 of 32767); scale it toward full
+// scale for the external I2S DAC. Tune to taste (4 ≈ 30% FS).
+// Output gain for the I2S DAC on the ST7789/PicoGB build. The NES APU mix is low
+// level; multiply it up toward 16-bit range (clamped). 12 clipped/too loud, 6 is
+// a comfortable level — tune here if needed.
+#define ST7789_AUDIO_GAIN 1
 #endif
 
 // DVI Gain (Q8). 256 = 1.0x, 384 = 1.5x, 512 = 2.0x
@@ -149,8 +171,16 @@ const WORD __not_in_flash_func(NesPalette)[64] = {
 #endif
 #if 1
 #if !HSTX
-// RGB565 to RGB444
+#if USE_ST7789
+// Keep the RGB555 source values as-is. The ST7789 driver converts RGB555->RGB565
+// at blit time, which also strips InfoNES's 0x8000 backdrop flag (bit 15). That
+// flag is needed by the sprite-priority logic (pPoint[i] >> 15) but must NOT reach
+// the RGB565 panel, where bit 15 is the red MSB.
+#define CC(x) (x)
+#else
+// RGB555 to RGB444 (PicoDVI 12bpp line buffer)
 #define CC(x) (((x >> 1) & 15) | (((x >> 6) & 15) << 4) | (((x >> 11) & 15) << 8))
+#endif
 const WORD __not_in_flash_func(NesPalette)[64] = {
     CC(0x39ce), CC(0x1071), CC(0x0015), CC(0x2013), CC(0x440e), CC(0x5402), CC(0x5000), CC(0x3c20),
     CC(0x20a0), CC(0x0100), CC(0x0140), CC(0x00e2), CC(0x0ceb), CC(0x0000), CC(0x0000), CC(0x0000),
@@ -758,6 +788,9 @@ int __not_in_flash_func(InfoNES_GetSoundBufferSize)()
         return 0;
     // Each DI packet carries 4 audio samples; use shift for fast multiply.
     return free_packets << 2;
+#elif USE_ST7789
+    // ST7789 backend: no DVI audio ring. I2S audio is added in a later phase.
+    return 0;
 #else
     // Non-HSTX path: return available ring buffer capacity directly.
     return dvi_->getAudioRingBuffer().getFullWritableSize();
@@ -825,7 +858,17 @@ void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wa
 #if PICO_RP2350
             recordSampleToSoundRecorder(l, r);
 #endif
+#if USE_ST7789
+            // The NES APU mix is very low level (≈0..2445 of 32767). Scale it up
+            // toward full 16-bit range so it isn't buried in DAC/amp noise. Clamp.
+            {
+                int gl = l * ST7789_AUDIO_GAIN; if (gl > 32767) gl = 32767;
+                int gr = r * ST7789_AUDIO_GAIN; if (gr > 32767) gr = 32767;
+                EXT_AUDIO_ENQUEUE_SAMPLE(gl, gr);
+            }
+#else
             EXT_AUDIO_ENQUEUE_SAMPLE(l, r);
+#endif
 #if ENABLE_VU_METER
             if (settings.flags.enableVUMeter)
             {
@@ -836,6 +879,10 @@ void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wa
         return;
     }
 #endif
+#if USE_ST7789
+    // ST7789 backend: no DVI audio ring. I2S audio is added in a later phase.
+    (void)samples; (void)wave1; (void)wave2; (void)wave3; (void)wave4; (void)wave5; (void)wave6;
+#else
     while (samples)
     {
         auto &ring = dvi_->getAudioRingBuffer();
@@ -876,6 +923,7 @@ void __not_in_flash_func(InfoNES_SoundOutput)(int samples, BYTE *wave1, BYTE *wa
         ring.advanceWritePointer(n);
         samples -= n;
     }
+#endif // USE_ST7789
 #else
 #if EXT_AUDIO_IS_ENABLED
     bool audioJackConnected = Frens::isHeadPhoneJackConnected();
@@ -976,6 +1024,21 @@ static void paceFrame(bool init)
 
 int InfoNES_LoadFrame()
 {
+#if USE_ST7789
+    // Pace the emulator to 60fps so game speed and audio rate stay correct (the
+    // display runs in parallel on core1). If a frame ran long, don't wait (catch
+    // up); resync after a long stall (menu / state load).
+    {
+        static uint64_t deadline = 0;
+        uint64_t now = time_us_64();
+        if (deadline == 0) deadline = now;
+        deadline += 16667;
+        if (now < deadline)
+            while (time_us_64() < deadline) tight_loop_contents();
+        else if (now > deadline + 50000)
+            deadline = time_us_64();
+    }
+#endif
 //      if (pendingLoadState) {         // perform at frame start
 //         pendingLoadState = false;
 //         printf("Loading state...\n");
@@ -1007,8 +1070,10 @@ int InfoNES_LoadFrame()
     nespad_read_start();
 #endif
     auto count =
-#if !HSTX
+#if !HSTX && !USE_ST7789
         dvi_->getFrameCounter();
+#elif USE_ST7789
+        []{ static uint32_t fc = 0; return fc++; }();
 #else
         hstx_getframecounter();
 #endif
@@ -1017,7 +1082,14 @@ int InfoNES_LoadFrame()
 #if NES_PIN_CLK != -1
     nespad_read_finish(); // Sets global nespad_state var
 #endif
-    tuh_task();
+#if USE_ST7789
+    gpio_buttons_update(); // sample the GP2..GP9 buttons into gamepad 0
+#endif
+#if ST7789_USB_DEVICE
+    tud_task();            // pump the USB CDC device stack (serial diagnostics)
+#else
+    tuh_task();            // pump the USB host stack (USB controller = player 2)
+#endif
     // Frame rate calculation
     if (settings.flags.displayFrameRate)
     {
@@ -1026,6 +1098,32 @@ int InfoNES_LoadFrame()
         fps = (1000000 - 1) / tick_us + 1;
         start_tick_us = Frens::time_us();
     }
+
+#if ST7789_USB_DEVICE
+    // DIAG: once/sec, report the emulator frame period (core0) and the display
+    // transfer time per frame (core1). If core1 > 16667 us the panel is the
+    // 60fps bottleneck (audio underruns); if core0 is the bigger number the
+    // emulation is. Lets us confirm objectively over serial (device build only).
+    {
+        static uint64_t dbg_next = 0;
+        static uint64_t dbg_prev = 0;
+        static uint32_t dbg_busy_prev = 0;
+        uint64_t nowdbg = time_us_64();
+        if (dbg_next == 0) dbg_next = nowdbg + 1000000;
+        if (nowdbg >= dbg_next)
+        {
+            uint32_t core0_us = dbg_prev ? (uint32_t)(nowdbg - dbg_prev) : 0;
+            uint32_t busy_now = st7789_core1_busy_us;
+            uint32_t core1_busy_per_s = busy_now - dbg_busy_prev;
+            dbg_busy_prev = busy_now;
+            printf("ST7789 diag: core0_frame=%lu us  core1_frame=%lu us  core1_busy=%lu us/s  (budget 16667)\n",
+                   (unsigned long)core0_us, (unsigned long)st7789_last_frame_us,
+                   (unsigned long)core1_busy_per_s);
+            dbg_next = nowdbg + 1000000;
+        }
+        dbg_prev = nowdbg;
+    }
+#endif
 
 #if !HSTX
 #else
@@ -1091,8 +1189,13 @@ int InfoNES_LoadFrame()
 namespace
 {
 #if !HSTX
+#if USE_ST7789
+    WORD *currentLineBuffer_{nullptr};
+    WORD *currentLineBuf{nullptr};
+#else
     dvi::DVI::LineBuffer *currentLineBuffer_{};
     WORD *currentLineBuf{nullptr};
+#endif
 #else
     WORD *currentLineBuffer_{nullptr};
 #endif
@@ -1104,7 +1207,11 @@ void __not_in_flash_func(drawWorkMeterUnit)(int timing,
 {
     if (timing >= 0 && timing < 640)
     {
+#if USE_ST7789
+        WORD *p = currentLineBuffer_;
+#else
         auto p = currentLineBuffer_->data();
+#endif
         p[timing] = tag; // tag = color
     }
 }
@@ -1116,14 +1223,19 @@ void __not_in_flash_func(drawWorkMeter)(int line)
         return;
     }
 
-    memset(currentLineBuffer_->data(), 0, 64);
-    memset(&currentLineBuffer_->data()[320 - 32], 0, 64);
-    (*currentLineBuffer_)[160] = 0;
+#if USE_ST7789
+    WORD *lb = currentLineBuffer_;
+#else
+    WORD *lb = currentLineBuffer_->data();
+#endif
+    memset(lb, 0, 64);
+    memset(&lb[320 - 32], 0, 64);
+    lb[160] = 0;
     if (line == 4)
     {
         for (int i = 1; i < 10; ++i)
         {
-            (*currentLineBuffer_)[16 * i] = 31;
+            lb[16 * i] = 31;
         }
     }
 
@@ -1284,11 +1396,18 @@ void __not_in_flash_func(InfoNES_PreDrawLine)(int line)
     else
     {
 #endif
+#if USE_ST7789
+        // Acquire a ring slot for core1 to display. The game fills the 256px
+        // centre; the static black side bars are cleared once at game start.
+        currentLineBuffer_ = st7789_ring_acquire();
+        InfoNES_SetLineBuffer(currentLineBuffer_ + 32, ST7789_WIDTH);
+#else
         util::WorkMeterMark(0xaaaa);
         auto b = dvi_->getLineBuffer();
         util::WorkMeterMark(0x5555);
         InfoNES_SetLineBuffer(b->data() + 32, b->size());
         currentLineBuffer_ = b;
+#endif
 #if FRAMEBUFFERISPOSSIBLE
     }
 #endif
@@ -1314,7 +1433,7 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     if (IsNSF)
     {
         WORD *buf =
-#if !HSTX
+#if !HSTX && !USE_ST7789
             currentLineBuf == nullptr ? currentLineBuffer_->data() : currentLineBuf;
 #else
             currentLineBuffer_;
@@ -1327,7 +1446,7 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     {
         char fpsString[2];
         WORD *fpsBuffer =
-#if !HSTX
+#if !HSTX && !USE_ST7789
             currentLineBuf == nullptr ? currentLineBuffer_->data() + 40 : currentLineBuf + 40;
 #else
             currentLineBuffer_ + 40;
@@ -1363,7 +1482,12 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     {
 #endif
         assert(currentLineBuffer_);
+#if USE_ST7789
+        st7789_convert_game_line(currentLineBuffer_); // RGB555->565 here on core0
+        st7789_ring_commit(line); // hand the rendered line to core1 for SPI DMA
+#else
         dvi_->setLineBuffer(line, currentLineBuffer_);
+#endif
         currentLineBuffer_ = nullptr;
 #if FRAMEBUFFERISPOSSIBLE
     }
@@ -1414,6 +1538,43 @@ int main()
 
     Frens::setClocksAndStartStdio(CPUFreqKHz, VREG_VOLTAGE_1_20);
 
+#if USE_ST7789
+    // Source clk_peri from clk_sys so the display SPI0 and the SD-card spi1 both
+    // run at full rate (the InfoNES RP2040 path leaves clk_peri capped). Done
+    // HERE, before initAll, so the SD mounts at the final peripheral clock —
+    // changing clk_peri after the SD mount would corrupt its SPI divisor and
+    // break file reads.
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                    clock_get_hz(clk_sys), clock_get_hz(clk_sys));
+#endif
+
+#if USE_ST7789 && ST7789_TEST_PATTERN
+    // EARLY bring-up test: runs immediately after clocks, BEFORE Frens::initAll,
+    // to isolate the ST7789 driver from SD/USB/menu init. Blinks the onboard LED
+    // (GP25) each colour so we can tell the loop is alive even if the panel is
+    // not, and cycles solid colours through the real next_linebuf->send_line path.
+    gpio_init(25);
+    gpio_set_dir(25, GPIO_OUT);
+    st7789_init();
+    {
+        static const uint16_t cols[] = {0xF800, 0x07E0, 0x001F, 0xFFFF, 0xFFE0, 0x07FF, 0x0000};
+        for (unsigned f = 0;; ++f)
+        {
+            gpio_put(25, f & 1);
+            uint16_t c = cols[f % (sizeof(cols) / sizeof(cols[0]))];
+            for (int row = 0; row < (int)ST7789_HEIGHT; ++row)
+            {
+                uint16_t *lb = st7789_next_linebuf();
+                for (unsigned x = 0; x < ST7789_WIDTH; ++x)
+                    lb[x] = c;
+                st7789_send_line(row, lb);
+            }
+            st7789_wait_idle();
+            sleep_ms(600);
+        }
+    }
+#endif
+
     printf("==========================================================================================\n");
     printf("Pico-InfoNES+ %s\n", SWVERSION);
     printf("Build date: %s\n", __DATE__);
@@ -1435,6 +1596,19 @@ int main()
     //     - When using framebuffer, AUDIOBUFFERSIZE must be increased to 1024
     //     - Top and bottom margins are reset to zero
     isFatalError = !Frens::initAll(selectedRom, CPUFreqKHz, 4, 4, AUDIOBUFFERSIZE, false, true);
+#if USE_ST7789 && !ST7789_TEST_PATTERN
+    // Bring up the ST7789 SPI panel (DVI is disabled in this build). Clocks are
+    // already configured by setClocksAndStartStdio() above. (In ST7789_TEST_PATTERN
+    // builds the panel is brought up earlier, before initAll.)
+    st7789_init();
+    gpio_buttons_init();
+    st7789_start_display_core1(); // core1 drives the panel; idle until a game commits lines
+#endif
+#if USE_ST7789
+    // This hardware has no DVI/HDMI audio path — always route sound to the I2S DAC,
+    // overriding any external-audio setting loaded from the SD card's settings file.
+    settings.flags.useExtAudio = 1;
+#endif
 
     scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
     bool showSplash = true;
@@ -1551,7 +1725,13 @@ int main()
                 menuPumpBlankFrames(180);
             }
             paceFrame(true); // reset pacing to avoid burst of frames if resetGame is true
+#if USE_ST7789
+            st7789_fill(0x0000); // clear the static side bars to black (game sends only the 256 centre)
+#endif
             InfoNES_Main(region);
+#if USE_ST7789
+            st7789_ring_flush(); // drain core1's in-flight lines before core0 redraws
+#endif
 
         } while (resetGame);
 #if !EMBEDDED_NES_ROM

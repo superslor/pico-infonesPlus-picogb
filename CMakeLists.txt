@@ -105,6 +105,49 @@ endif()
 message("PIO USB support: ${ENABLE_PIO_USB}, using PIO: ${PIO_USB_USE_PIO}")
 
 # ---------------------------------------------------------------------------
+# ST7789 SPI display backend (PicoGB hardware). When USE_ST7789=1 the DVI/HDMI
+# video output is disabled and the NES picture is driven to an ST7789 SPI panel
+# instead. Defined globally (here, before add_subdirectory) so the flag also
+# reaches the pico_shared submodule (FrensHelpers.cpp).
+# ---------------------------------------------------------------------------
+if(NOT DEFINED USE_ST7789)
+    set(USE_ST7789 0)
+endif()
+add_compile_definitions(USE_ST7789=${USE_ST7789})
+message("ST7789 SPI display backend: USE_ST7789=${USE_ST7789}")
+
+# ---------------------------------------------------------------------------
+# USB role for the ST7789 (PicoGB) build. The single RP2040 USB controller can
+# be EITHER a host (TinyUSB xinput/hid -> a USB pad as player 2) OR a CDC device
+# (serial /dev/ttyACM* for diagnostics) — not both. Default = HOST (the shipping
+# build, USB controller works). Configure with -DST7789_USB_SERIAL=1 to build the
+# diagnostics variant instead. Only meaningful when USE_ST7789=1.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED ST7789_USB_SERIAL)
+    set(ST7789_USB_SERIAL 0)
+endif()
+if(USE_ST7789 AND ST7789_USB_SERIAL)
+    set(ST7789_USB_DEVICE 1)
+else()
+    set(ST7789_USB_DEVICE 0)
+endif()
+add_compile_definitions(ST7789_USB_SERIAL=${ST7789_USB_SERIAL})
+# Single macro the C/C++ + tusb_config use: 1 only when the ST7789 build is in CDC
+# device mode (so passing -DST7789_USB_SERIAL=1 without -DUSE_ST7789 stays host).
+add_compile_definitions(ST7789_USB_DEVICE=${ST7789_USB_DEVICE})
+message("ST7789 USB role: ${ST7789_USB_DEVICE} (1=CDC serial device, 0=USB host)")
+if(USE_ST7789)
+    # NES APU audio is unipolar (large DC offset). Enable the I2S driver's
+    # PCM5000A DC-blocking filter so the DC bias doesn't distort on the DAC.
+    add_compile_definitions(I2S_AUDIO_COMPENSATE_DC_OFFSET=1)
+endif()
+# Optional hardware bring-up test pattern (cmake -DST7789_TEST_PATTERN=1)
+if(NOT DEFINED ST7789_TEST_PATTERN)
+    set(ST7789_TEST_PATTERN 0)
+endif()
+add_compile_definitions(ST7789_TEST_PATTERN=${ST7789_TEST_PATTERN})
+
+# ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
 add_executable(${projectname}
@@ -113,6 +156,8 @@ add_executable(${projectname}
     DefaultSS444.c
     DefaultSS555.c
     state.cpp
+    st7789.c
+    gpio_buttons.cpp
 )
 
 # Optional: embed a NES ROM directly into the firmware.
@@ -146,7 +191,12 @@ if(UART_ENABLED EQUAL 0)
 else()
     pico_enable_stdio_uart(${projectname} 1)
 endif()
-pico_enable_stdio_usb(${projectname} 0)
+if(ST7789_USB_DEVICE)
+    # CDC serial over USB for diagnostics (board is a USB device on this build).
+    pico_enable_stdio_usb(${projectname} 1)
+else()
+    pico_enable_stdio_usb(${projectname} 0)
+endif()
 
 # ---------------------------------------------------------------------------
 # What family_configure_target() used to do for us, inlined:
@@ -264,6 +314,7 @@ target_link_libraries(${projectname} PRIVATE
     pico_stdlib
     pico_multicore
     hardware_dma
+    hardware_spi
     hardware_pio
     hardware_i2c
     hardware_interp
@@ -274,11 +325,29 @@ target_link_libraries(${projectname} PRIVATE
     dvi
     util
     infones
-    tinyusb_host
     tinyusb_board
     pico_shared
-    xinput_host
 )
+
+# USB role. The PicoGB build (USE_ST7789) takes input from the GPIO buttons, not
+# a USB controller, so the single RP2040 USB controller is configured as a CDC
+# DEVICE: the board enumerates as /dev/ttyACM* and printf() goes out over the USB
+# cable for diagnostics. All other boards use the TinyUSB HOST stack for USB pads.
+if(ST7789_USB_DEVICE)
+    target_link_libraries(${projectname} PRIVATE pico_stdio_usb)
+    # pico_stdio_usb provides the CDC descriptors, but only auto-enables them when
+    # the app isn't otherwise pulling in TinyUSB device (LIB_TINYUSB_DEVICE). Our
+    # tusb_config.h enables the device stack, so force the default descriptors on.
+    # Also drop the vendor-specific reset-to-BOOTSEL interface: we don't enable
+    # CFG_TUD_VENDOR, so that extra interface makes TinyUSB STALL SET_CONFIG
+    # (host: "can't set config #1, error -32"). A plain CDC-only device enumerates.
+    target_compile_definitions(${projectname} PRIVATE
+        PICO_STDIO_USB_USE_DEFAULT_DESCRIPTORS=1
+        PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=0
+    )
+else()
+    target_link_libraries(${projectname} PRIVATE tinyusb_host xinput_host)
+endif()
 
 if(PICO_BOARD STREQUAL "pico_w" OR PICO_BOARD STREQUAL "pico2_w")
     target_link_libraries(${projectname} PRIVATE pico_cyw43_arch_none)
@@ -288,15 +357,19 @@ target_include_directories(${projectname} PRIVATE
     pico_lib
     pico_shared
     infones
-    tusb_xinput
     .
 )
+if(NOT ST7789_USB_DEVICE)
+    target_include_directories(${projectname} PRIVATE tusb_xinput)
+endif()
 
 add_subdirectory(infones)
 add_subdirectory(pico_lib/dvi)
 add_subdirectory(pico_lib/util)
 add_subdirectory(pico_shared)
-add_subdirectory(tusb_xinput xinput_host)
+if(NOT ST7789_USB_DEVICE)
+    add_subdirectory(tusb_xinput xinput_host)
+endif()
 
 target_link_options(${projectname} PRIVATE -Xlinker --print-memory-usage --data-sections)
 
