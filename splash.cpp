@@ -36,6 +36,10 @@ void splash()
     strcpy(s, "@shuichi_takano_____fliperama86");
     putText(SCREEN_COLS / 2 - strlen(s) / 2, 10, s, CLIGHTBLUE, bgcolorSplash);
 #endif
+    strcpy(s, "ST7789 Portable Port");
+    putText(SCREEN_COLS / 2 - strlen(s) / 2, 11, s, fgcolorSplash, bgcolorSplash);
+    strcpy(s, "Slor");
+    putText(SCREEN_COLS / 2 - strlen(s) / 2, 12, s, CLIGHTBLUE, bgcolorSplash);
     strcpy(s, "Menu System & SD Card Support");
     putText(SCREEN_COLS / 2 - strlen(s) / 2, 13, s, fgcolorSplash, bgcolorSplash);
     strcpy(s, "@frenskefrens");

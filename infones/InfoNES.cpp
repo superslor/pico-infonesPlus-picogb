@@ -1035,6 +1035,16 @@ namespace
 /*              InfoNES_DrawLine() : Render a scanline               */
 /*                                                                   */
 /*===================================================================*/
+/* Value used to CLEAR a scanline to "black" (line start, BG left-clip, up/down clip).
+ * DVI path stores RGB555, where 0x00 = black. The ST7789 path stores 1-BYTE PALETTE INDICES,
+ * where index 0 is GREY (0x39ce) and black is index 0x0F — so clear with 0x0F there (byte-fill
+ * => WORD 0x0F0F, whose low byte is the index the driver reads; bit15 stays 0 = no backdrop
+ * flag, so sprite priority is unaffected). */
+#if USE_ST7789
+#define INFONES_LINE_CLEAR 0x0F
+#else
+#define INFONES_LINE_CLEAR 0x00
+#endif
 void __not_in_flash_func(InfoNES_DrawLine)()
 {
   /*
@@ -1075,7 +1085,7 @@ void __not_in_flash_func(InfoNES_DrawLine)()
   // Clear a scanline if screen is off
   if (!(PPU_R1 & R1_SHOW_SCR))
   {
-    InfoNES_MemorySet(pPoint, 0, NES_DISP_WIDTH << 1);
+    InfoNES_MemorySet(pPoint, INFONES_LINE_CLEAR, NES_DISP_WIDTH << 1);
   }
   else
   {
@@ -1369,7 +1379,7 @@ void __not_in_flash_func(InfoNES_DrawLine)()
 
       // pPointTop = &WorkFrame[PPU_Scanline * NES_DISP_WIDTH];
       pPointTop = WorkLine;
-      InfoNES_MemorySet(pPointTop, 0, 8 << 1);
+      InfoNES_MemorySet(pPointTop, INFONES_LINE_CLEAR, 8 << 1);
     }
 
     /*-------------------------------------------------------------------*/
@@ -1382,7 +1392,7 @@ void __not_in_flash_func(InfoNES_DrawLine)()
 
       // pPointTop = &WorkFrame[PPU_Scanline * NES_DISP_WIDTH];
       pPointTop = WorkLine;
-      InfoNES_MemorySet(pPointTop, 0, NES_DISP_WIDTH << 1);
+      InfoNES_MemorySet(pPointTop, INFONES_LINE_CLEAR, NES_DISP_WIDTH << 1);
     }
   }
 
@@ -1643,7 +1653,7 @@ void __not_in_flash_func(InfoNES_DrawLine)()
 
       // pPointTop = &WorkFrame[PPU_Scanline * NES_DISP_WIDTH];
       pPointTop = WorkLine;
-      InfoNES_MemorySet(pPointTop, 0, 8 << 1);
+      InfoNES_MemorySet(pPointTop, INFONES_LINE_CLEAR, 8 << 1);
     }
 
     if (nSprCnt >= 8)

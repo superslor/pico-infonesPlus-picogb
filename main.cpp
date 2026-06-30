@@ -44,10 +44,13 @@ static uint32_t start_tick_us = 0;
 static uint32_t fps = 0;
 static uint8_t framesbeforeAutoStateIsLoaded = 0;
 #if USE_ST7789
-// 280 MHz on the PicoGB build: faster emulation AND SPI0 = clk_peri/4 = 70 MHz
-// (vs 63 MHz at 252), ~11% more display bandwidth so core1 stays under the
-// 16.67 ms/frame budget and the I2S audio never underruns. VREG already 1.20V.
-#define EMULATOR_CLOCKFREQ_KHZ 280000 //  Overclock frequency in kHz when using Emulator
+// 292 MHz on the PicoGB build: SPI0 = clk_peri/4 = 73 MHz baud. The RP2040 PL022
+// inserts ~1.5 clocks between 16-bit frames, so effective throughput ≈ 66.7 MHz
+// (vs ~64 at 280) — enough to drive the wider 8:7 (292px) image at 60fps. Also
+// speeds emulation + the horizontal scaler. MUST be an exactly-achievable PLL freq
+// (VCO=12*N): 292 = VCO 876 (12*73) / 3. 290 is NOT achievable -> set_sys_clock_khz
+// panics. 300 (achievable) was unstable at 1.20V; we run 1.25V (see vreg below).
+#define EMULATOR_CLOCKFREQ_KHZ 292000 //  Overclock frequency in kHz when using Emulator
 #else
 #define EMULATOR_CLOCKFREQ_KHZ 252000 //  Overclock frequency in kHz when using Emulator
 #endif
@@ -64,17 +67,88 @@ static uint8_t framesbeforeAutoStateIsLoaded = 0;
 #if USE_ST7789
 // Output gain for the I2S DAC on the ST7789/PicoGB build. The NES APU mix is very
 // low level (≈0..2445 of 32767), so this multiplies it toward full scale (clamped).
-// Runtime-adjustable in-game with SELECT+LEFT/RIGHT (see InfoNES_PadState); 0 = mute.
-// Stored in settings.audioGain (persisted to the SD settings file) so it survives
-// reboots / game changes. Default 1 (a comfortable level).
+// Stored in settings.audioGain (persisted). Default 1 (a comfortable level). Adjusted
+// in-game with SELECT+LEFT/RIGHT (down/up).
 #define ST7789_AUDIO_GAIN_MIN 0
 #define ST7789_AUDIO_GAIN_MAX 6
-// Frames to keep the on-screen volume indicator visible after a change, and a
-// debounce so we write the settings file only once after adjustment settles.
-#define ST7789_VOL_OSD_FRAMES   90
-#define ST7789_VOL_SAVE_FRAMES  60
-static int g_volOsdFrames = 0;     // >0 => draw the indicator (counts down per frame)
-static int g_volSaveCountdown = 0; // >0 => save settings when it reaches 0
+
+// Frames to keep the on-screen "VOL n" indicator visible after a change, and a debounce
+// so we write the settings file only once after adjustment settles.
+#define ST7789_OSD_FRAMES       90
+#define ST7789_OSD_SAVE_FRAMES  60
+static int  g_osdFrames = 0;        // >0 => draw the indicator (counts down per frame)
+static int  g_osdSaveCountdown = 0; // >0 => save settings when it reaches 0
+enum { OSD_VOL = 0, OSD_SYNC = 1, OSD_PACE = 2 }; // which value the on-screen indicator shows
+static int g_osdKind = OSD_VOL;
+
+// In-game sync (anti-tearing pacer) trim range, in TENTHS of a us (0.1us step, SELECT+B+L/R).
+// + = faster fps / shorter frame. [-8000,3000] tenths = [-800,+300] us, same span as before.
+#define ST7789_SYNC_ADJ_MIN (-20000)  /* tenths-of-us; wide enough to re-park after an FRCTRL2 line-rate change */
+#define ST7789_SYNC_ADJ_MAX (8000)
+#define ST7789_SYNC_ADJ_STEP (1)       /* fine parking step = 1 tenth = 0.1us per press (SELECT+B+L/R) */
+
+// In-game per-line DMA pace range (tear-angle knob, SELECT+A+L/R). clk_sys/y word rate, so
+// smaller y = faster write = toward horizontal. Bounded: below ~70 pacing stops mattering
+// (SPI-limited); above ~96 core1 runs out of frame budget (underrun). Watch the diag fps.
+#define ST7789_DMA_PACE_MIN (70)
+#define ST7789_DMA_PACE_MAX (110)
+
+// Screen mode -> panel: scanlines on for the SCANLINE_* modes, 1:1 aspect for the *_1_1
+// modes. Pushed to the panel via st7789_set_scanlines() / st7789_set_aspect().
+#define ST7789_SCANLINES_ON() (settings.screenMode == ScreenMode::SCANLINE_8_7 || \
+                               settings.screenMode == ScreenMode::SCANLINE_1_1)
+#define ST7789_ASPECT_1_1()   (settings.screenMode == ScreenMode::SCANLINE_1_1 || \
+                               settings.screenMode == ScreenMode::NOSCANLINE_1_1)
+
+// Cycle the screen mode in-game WITHOUT writing the settings file. Frens::screenMode()
+// calls FrensSettings::savesettings() on every press, and that SD write blocks core0 for
+// several ms (audio underrun + a video hitch). Instead we cycle the mode in RAM, apply it
+// to the panel, and arm the same debounced-save countdown the volume control uses, so the
+// SD write happens just once, ~1s after the last press. Mirrors Frens::screenMode()'s wrap.
+static bool st7789_cycle_screen_mode(int incr)
+{
+    constexpr int kModeCount = 4;
+    // Cycle order for SELECT+UP (incr=+1): 8:7 no-SL (default) -> 8:7 SL -> 1:1 no-SL -> 1:1 SL -> wrap.
+    // SELECT+DOWN (incr=-1) walks it backwards. (The raw enum order differs, so we map through this.)
+    static const int kCycle[kModeCount] = {
+        static_cast<int>(ScreenMode::NOSCANLINE_8_7),
+        static_cast<int>(ScreenMode::SCANLINE_8_7),
+        static_cast<int>(ScreenMode::NOSCANLINE_1_1),
+        static_cast<int>(ScreenMode::SCANLINE_1_1),
+    };
+    int pos = 0;
+    for (int i = 0; i < kModeCount; i++)
+        if (kCycle[i] == static_cast<int>(settings.screenMode)) { pos = i; break; }
+    int current = static_cast<int>(settings.screenMode);
+    for (int attempts = 0; attempts < kModeCount; attempts++)
+    {
+        pos = (pos + incr) & 3; // wrap 0..3 within the cycle order
+        if (g_available_screen_modes[kCycle[pos]])
+        {
+            current = kCycle[pos];
+            break;
+        }
+    }
+    settings.screenMode = static_cast<ScreenMode>(current);
+    bool scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode); // applies, does NOT save
+    st7789_set_scanlines(ST7789_SCANLINES_ON());
+    st7789_set_aspect(ST7789_ASPECT_1_1());
+    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES; // persist once, after presses settle
+    return scaleMode8_7_;
+}
+
+// Match the I2S DAC sample rate to our ACTUAL frame rate so the audio buffer never drifts
+// when the pacer is tuned off 60.0fps to park the tearing seam. The APU emits 735 samples
+// per frame (NTSC 44100/60). syncSpeedAdj is in TENTHS of a us, so the frame period in tenths
+// is (166670 - syncSpeedAdj); matched rate = 735e6 / period_us = 7350e6 / period_tenths.
+// ~44100Hz at sync 0, ~43989Hz at -415 — the <0.3% pitch shift is inaudible, but it removes
+// the slow-drain/underrun that forced us to 60.0fps. Call at game start and on every change.
+static void st7789_match_audio_clock(void)
+{
+    int32_t period_tenths = 166670 - settings.syncSpeedAdj;
+    if (period_tenths > 0 && settings.flags.useExtAudio)
+        EXT_AUDIO_SET_SAMPLE_RATE((uint32_t)(7350000000ULL / (uint32_t)period_tenths));
+}
 #endif
 
 // DVI Gain (Q8). 256 = 1.0x, 384 = 1.5x, 512 = 2.0x
@@ -222,6 +296,30 @@ const WORD __not_in_flash_func(NesPalette)[64] = {
     CC(0xB6EAE5), CC(0xB8B8B8), CC(0x000000), CC(0x000000)};
 #endif
 #endif
+
+#if USE_ST7789
+// Very-slight saturation boost, applied once to the NES palette at startup (zero per-
+// frame cost). Per RGB555 channel: out = luma + (chan - luma) * NUM/16; NUM=16 is no-op.
+#define ST7789_SAT_NUM 17   // 17/16 = +6.25% saturation (gentle)
+static void st7789ApplyPaletteSaturation(void)
+{
+    WORD *pal = (WORD *)NesPalette;   // RAM-resident (__not_in_flash_func); boosted once, pre-render
+    for (int i = 0; i < 64; i++)
+    {
+        int v = pal[i];
+        int r = (v >> 10) & 0x1F, g = (v >> 5) & 0x1F, b = v & 0x1F;
+        int luma = (5 * r + 9 * g + 2 * b) >> 4;        // approx luma (weights sum to 16)
+        r = luma + (((r - luma) * ST7789_SAT_NUM) >> 4);
+        g = luma + (((g - luma) * ST7789_SAT_NUM) >> 4);
+        b = luma + (((b - luma) * ST7789_SAT_NUM) >> 4);
+        if (r < 0) r = 0; else if (r > 31) r = 31;
+        if (g < 0) g = 0; else if (g > 31) g = 31;
+        if (b < 0) b = 0; else if (b > 31) b = 31;
+        pal[i] = (WORD)((r << 10) | (g << 5) | b);
+    }
+}
+#endif
+
 uint32_t getCurrentNVRAMAddr()
 {
 
@@ -358,6 +456,8 @@ bool loadNVRAM()
 
 static DWORD prevButtons[2]{};
 static int rapidFireMask[2]{};
+static bool g_syncBUsed[2]{}; // per-player: B-hold consumed by a SELECT+B+L/R sync gesture (undoes the B-press rapid-fire toggle)
+static bool g_paceAUsed[2]{}; // per-player: A-hold consumed by a SELECT+A+L/R pace gesture (undoes the A-press rapid-fire toggle)
 static int rapidFireCounter = 0;
 static bool reset = false;
 static bool resetGame = false;
@@ -504,33 +604,61 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
                 showSettings = true;
             }
             if (pushed & A)
-            {            
+            {
                rapidFireMask[i] ^= io::GamePadState::Button::A;
-               //g_dvi_audio_gain_q8 = g_dvi_audio_gain_q8 == DVI_AUDIO_GAIN_Q8 ? 256 : DVI_AUDIO_GAIN_Q8;
+               g_paceAUsed[i] = false; // fresh A-hold; a SELECT+A+L/R pace gesture will undo this toggle
             }
             if (pushed & B)
             {
-                
                 rapidFireMask[i] ^= io::GamePadState::Button::B;
-               
+                g_syncBUsed[i] = false; // fresh B-hold; a SELECT+B+L/R sync gesture will undo this toggle
             }
             if (pushed & UP)
             {
+#if USE_ST7789
+                scaleMode8_7_ = st7789_cycle_screen_mode(+1); // SELECT+UP: forward through the cycle order
+#else
                 scaleMode8_7_ = Frens::screenMode(-1);
+#endif
             } else if (pushed & DOWN)
             {
+#if USE_ST7789
+                scaleMode8_7_ = st7789_cycle_screen_mode(-1); // SELECT+DOWN: backward through the cycle order
+#else
                 scaleMode8_7_ = Frens::screenMode(+1);
+#endif
             } else if (pushed & LEFT)
             {
 #if USE_ST7789
-                // SELECT+LEFT = volume down (step 1). On this build there is no DVI
-                // audio path, so the audio-output toggle used here on other boards
-                // would just silence the panel — repurpose it for the I2S gain.
-                if (i == 0 && settings.audioGain > ST7789_AUDIO_GAIN_MIN)
+                if (i == 0 && (v & A)) // SELECT+A+LEFT = pace FASTER write (lower y), rotate tear toward horizontal
+                {
+                    if (!g_paceAUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::A; g_paceAUsed[i] = true; } // cancel the A-press rapid-fire toggle
+                    if (settings.dmaPaceY > ST7789_DMA_PACE_MIN) settings.dmaPaceY--;
+                    st7789_set_dma_pace((uint16_t)settings.dmaPaceY);
+                    g_osdKind = OSD_PACE;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
+                    printf("dmaPaceY: %d\n", settings.dmaPaceY);
+                }
+                else if (i == 0 && (v & B)) // SELECT+B+LEFT = sync SLOWER (coarse 10us), park the seam
+                {
+                    if (!g_syncBUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::B; g_syncBUsed[i] = true; } // cancel the B-press rapid-fire toggle
+                    settings.syncSpeedAdj -= ST7789_SYNC_ADJ_STEP;
+                    if (settings.syncSpeedAdj < ST7789_SYNC_ADJ_MIN) settings.syncSpeedAdj = ST7789_SYNC_ADJ_MIN;
+                    st7789_match_audio_clock(); // keep audio locked to the new frame rate
+                    g_osdKind = OSD_SYNC;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
+                    printf("syncSpeedAdj: %d\n", settings.syncSpeedAdj);
+                }
+                // SELECT+LEFT = volume down (step 1). No DVI audio path on this build, so
+                // the audio-output toggle used on other boards is repurposed for I2S gain.
+                else if (i == 0 && settings.audioGain > ST7789_AUDIO_GAIN_MIN)
                 {
                     settings.audioGain--;
-                    g_volOsdFrames = ST7789_VOL_OSD_FRAMES;
-                    g_volSaveCountdown = ST7789_VOL_SAVE_FRAMES;
+                    g_osdKind = OSD_VOL;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
                     printf("Audio gain: %d\n", settings.audioGain);
                 }
 #else
@@ -555,12 +683,34 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
 #if USE_ST7789
             else if (pushed & RIGHT)
             {
+                if (i == 0 && (v & A)) // SELECT+A+RIGHT = pace SLOWER write (higher y), rotate tear toward vertical
+                {
+                    if (!g_paceAUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::A; g_paceAUsed[i] = true; } // cancel the A-press rapid-fire toggle
+                    if (settings.dmaPaceY < ST7789_DMA_PACE_MAX) settings.dmaPaceY++;
+                    st7789_set_dma_pace((uint16_t)settings.dmaPaceY);
+                    g_osdKind = OSD_PACE;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
+                    printf("dmaPaceY: %d\n", settings.dmaPaceY);
+                }
+                else if (i == 0 && (v & B)) // SELECT+B+RIGHT = sync FASTER (coarse 10us), park the seam
+                {
+                    if (!g_syncBUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::B; g_syncBUsed[i] = true; } // cancel the B-press rapid-fire toggle
+                    settings.syncSpeedAdj += ST7789_SYNC_ADJ_STEP;
+                    if (settings.syncSpeedAdj > ST7789_SYNC_ADJ_MAX) settings.syncSpeedAdj = ST7789_SYNC_ADJ_MAX;
+                    st7789_match_audio_clock();
+                    g_osdKind = OSD_SYNC;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
+                    printf("syncSpeedAdj: %d\n", settings.syncSpeedAdj);
+                }
                 // SELECT+RIGHT = volume up (step 1).
-                if (i == 0 && settings.audioGain < ST7789_AUDIO_GAIN_MAX)
+                else if (i == 0 && settings.audioGain < ST7789_AUDIO_GAIN_MAX)
                 {
                     settings.audioGain++;
-                    g_volOsdFrames = ST7789_VOL_OSD_FRAMES;
-                    g_volSaveCountdown = ST7789_VOL_SAVE_FRAMES;
+                    g_osdKind = OSD_VOL;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
                     printf("Audio gain: %d\n", settings.audioGain);
                 }
             }
@@ -1059,24 +1209,34 @@ int InfoNES_LoadFrame()
 #if USE_ST7789
     // Pace the emulator to 60fps so game speed and audio rate stay correct (the
     // display runs in parallel on core1). If a frame ran long, don't wait (catch
-    // up); resync after a long stall (menu / state load).
+    // up); resync after a long stall (menu / state load). The period is nudged by
+    // settings.syncSpeedAdj (SELECT+RIGHT faster / LEFT slower) to match the panel's
+    // free-running refresh and park the tear off-screen (anti-tearing sync tuner).
     {
+        // syncSpeedAdj is in TENTHS of a us. Accumulate the fractional part and only ever add
+        // whole us to the deadline, carrying the remainder -> the frame period DITHERS between
+        // adjacent whole-us values so its AVERAGE hits the sub-us target. That parks the seam at
+        // a fractional sweet spot the 1us pacer couldn't reach; the ±0.5us jitter is invisible.
         static uint64_t deadline = 0;
+        static int32_t  frac_tenths = 0;
         uint64_t now = time_us_64();
         if (deadline == 0) deadline = now;
-        deadline += 16667;
+        frac_tenths += (166670 - settings.syncSpeedAdj);   // frame period in tenths-of-us
+        uint32_t whole_us = (uint32_t)(frac_tenths / 10);
+        frac_tenths -= (int32_t)(whole_us * 10);            // carry 0..9 tenths to next frame
+        deadline += whole_us;
         if (now < deadline)
             while (time_us_64() < deadline) tight_loop_contents();
         else if (now > deadline + 50000)
-            deadline = time_us_64();
+            { deadline = time_us_64(); frac_tenths = 0; }
     }
 
     // Volume control housekeeping (once per frame): fade out the on-screen
     // indicator, and persist a changed gain to the settings file once the user
     // has stopped adjusting (debounced, so we don't write the SD every press).
-    if (g_volOsdFrames > 0)
-        g_volOsdFrames--;
-    if (g_volSaveCountdown > 0 && --g_volSaveCountdown == 0)
+    if (g_osdFrames > 0)
+        g_osdFrames--;
+    if (g_osdSaveCountdown > 0 && --g_osdSaveCountdown == 0)
         FrensSettings::savesettings();
 #endif
 //      if (pendingLoadState) {         // perform at frame start
@@ -1140,28 +1300,54 @@ int InfoNES_LoadFrame()
     }
 
 #if ST7789_USB_DEVICE
-    // DIAG: once/sec, report the emulator frame period (core0) and the display
-    // transfer time per frame (core1). If core1 > 16667 us the panel is the
-    // 60fps bottleneck (audio underruns); if core0 is the bigger number the
-    // emulation is. Lets us confirm objectively over serial (device build only).
+    // DIAG: accumulate per-frame stats and print a summary once/sec. This shows
+    // whether OUR output is the problem (jitter / dropped frames => fixable) or
+    // whether we are dead-steady at 60.0 fps and the "shifty" motion is purely the
+    // panel's free-running refresh beating against us (=> needs frame-rate matching
+    // or a TE wire). Run while playing a SCROLLING game so the load is realistic.
+    //   fps      : frames counted in the last second (want ~60, rock steady)
+    //   avg/min/max/jitter : core0 frame interval in us (want ~16667, tight spread)
+    //   late     : frames whose interval exceeded 17000us (a visible hitch each)
+    //   c1_disp  : us/sec core1 was actually driving the display (1e6 - idle); the
+    //              true per-frame display cost = c1_disp/fps. Lower = more headroom
+    //              for a wider (aspect-correct) image. Measured WITHOUT per-line
+    //              timer reads, so it reflects the real (shipping-build) cost.
     {
-        static uint64_t dbg_next = 0;
-        static uint64_t dbg_prev = 0;
-        static uint32_t dbg_busy_prev = 0;
-        uint64_t nowdbg = time_us_64();
-        if (dbg_next == 0) dbg_next = nowdbg + 1000000;
-        if (nowdbg >= dbg_next)
+        static uint64_t win_start = 0, prev = 0;
+        static uint32_t frames = 0, late = 0, mn = 0xffffffff, mx = 0, sum = 0;
+        static uint32_t idle_prev = 0, block_prev = 0;
+        uint64_t now = time_us_64();
+        if (prev != 0)
         {
-            uint32_t core0_us = dbg_prev ? (uint32_t)(nowdbg - dbg_prev) : 0;
-            uint32_t busy_now = st7789_core1_busy_us;
-            uint32_t core1_busy_per_s = busy_now - dbg_busy_prev;
-            dbg_busy_prev = busy_now;
-            printf("ST7789 diag: core0_frame=%lu us  core1_frame=%lu us  core1_busy=%lu us/s  (budget 16667)\n",
-                   (unsigned long)core0_us, (unsigned long)st7789_last_frame_us,
-                   (unsigned long)core1_busy_per_s);
-            dbg_next = nowdbg + 1000000;
+            uint32_t dt = (uint32_t)(now - prev);
+            frames++; sum += dt;
+            if (dt < mn) mn = dt;
+            if (dt > mx) mx = dt;
+            if (dt > 17000) late++;
         }
-        dbg_prev = nowdbg;
+        prev = now;
+        if (win_start == 0) win_start = now;
+        uint32_t win = (uint32_t)(now - win_start);
+        if (win >= 1000000)
+        {
+            uint32_t idle_now = st7789_core1_idle_us;
+            uint32_t idle_d = idle_now - idle_prev;
+            uint32_t disp = (idle_d < win) ? (win - idle_d) : 0; /* active us over the window */
+            uint32_t block_now = st7789_acquire_block_us;
+            uint32_t c0block = block_now - block_prev; /* us core0 waited on core1 */
+            uint32_t avg = frames ? sum / frames : 0;
+            // ScreenMode enum order: 0=SCANLINE_8_7 1=NOSCANLINE_8_7 2=SCANLINE_1_1 3=NOSCANLINE_1_1
+            static const char *kModeName[4] = { "8:7+SL", "8:7", "1:1+SL", "1:1" };
+            int modeIdx = (int)settings.screenMode & 3;
+            printf("diag: %lu fps mode=%s pace=%d c1_disp=%lu/f c0block=%lu/f  calib=%lu us/%u words  clk_peri=%lu Hz  spi_baud=%lu Hz\n",
+                   (unsigned long)frames, kModeName[modeIdx], (int)settings.dmaPaceY,
+                   (unsigned long)(frames ? disp / frames : 0),
+                   (unsigned long)(frames ? c0block / frames : 0),
+                   (unsigned long)st7789_calib_us, (unsigned)(ST7789_OUT_WIDTH * 32u),
+                   (unsigned long)st7789_calib_clkperi, (unsigned long)st7789_calib_baud);
+            idle_prev = idle_now; block_prev = block_now;
+            win_start = now; frames = 0; late = 0; mn = 0xffffffff; mx = 0; sum = 0;
+        }
     }
 #endif
 
@@ -1186,7 +1372,14 @@ int InfoNES_LoadFrame()
     if (showSettings && !IsNSF)
     {
         showSettings = false;
+#if USE_ST7789
+        st7789_ring_flush();            // quiesce core1 so core0 can draw the overlay
+        st7789_set_color_mode(false);   // overlay uses the menu's 16-bit RGB565 path
+#endif
         int rval = showSettingsMenu(true);
+#if USE_ST7789
+        st7789_set_color_mode(true);    // back to 12-bit for the game
+#endif
         if (rval == 3)
         {
             reset = true;
@@ -1216,7 +1409,15 @@ int InfoNES_LoadFrame()
            
             char msg[24];
             snprintf(msg, sizeof(msg), "Mapper %03d CRC %08X", MapperNo, Frens::getCrcOfLoadedRom());
-            if ( showSaveStateMenu(Emulator_SaveState, Emulator_LoadState, msg, quickSaveAction) == false ) {
+#if USE_ST7789
+            st7789_ring_flush();            // quiesce core1 so core0 can draw the overlay
+            st7789_set_color_mode(false);   // overlay uses the menu's 16-bit RGB565 path
+#endif
+            bool kept = showSaveStateMenu(Emulator_SaveState, Emulator_LoadState, msg, quickSaveAction);
+#if USE_ST7789
+            st7789_set_color_mode(true);    // back to 12-bit for the game
+#endif
+            if ( kept == false ) {
                 reset = true;
             };
             loadSaveStateMenu = false;
@@ -1437,10 +1638,13 @@ void __not_in_flash_func(InfoNES_PreDrawLine)(int line)
     {
 #endif
 #if USE_ST7789
-        // Acquire a ring slot for core1 to display. The game fills the 256px
-        // centre; the static black side bars are cleared once at game start.
+        // Acquire a ring slot and render the RAW NES scanline straight into it (no core0
+        // scaling pass — that is what frees core0 to hit 60 fps). core1 scales the slot
+        // 256->OUT_WIDTH (or, for NSF, converts its full-width UI) as it streams the line
+        // to the panel. Side bars are cleared once at game start.
         currentLineBuffer_ = st7789_ring_acquire();
-        InfoNES_SetLineBuffer(currentLineBuffer_ + 32, ST7789_WIDTH);
+        st7789_set_nsf_mode(IsNSF);
+        InfoNES_SetLineBuffer(currentLineBuffer_, ST7789_NES_WIDTH);
 #else
         util::WorkMeterMark(0xaaaa);
         auto b = dvi_->getLineBuffer();
@@ -1486,7 +1690,9 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     {
         char fpsString[2];
         WORD *fpsBuffer =
-#if !HSTX && !USE_ST7789
+#if USE_ST7789
+            currentLineBuffer_ + 8;   // ring slot, NES column 8 (core1 scales it)
+#elif !HSTX
             currentLineBuf == nullptr ? currentLineBuffer_->data() + 40 : currentLineBuf + 40;
 #else
             currentLineBuffer_ + 40;
@@ -1517,21 +1723,30 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
     }
 
 #if USE_ST7789
-    // Volume OSD: for a short while after a SELECT+LEFT/RIGHT change, draw "VOL n"
-    // near the top of the picture (8x8 font, one 8px-tall band at rows 16..23).
-    // Written here in RGB555 (NesPalette) so st7789_convert_game_line below turns
-    // it into RGB565 along with the rest of the scanline.
-    if (g_volOsdFrames > 0 && line >= 16 && line < 24)
+    // Volume OSD: for a short while after a SELECT+LEFT/RIGHT change, draw "VOL n" near
+    // the top of the picture (8x8 font, one 8px-tall band at rows 16..23). Written into
+    // the ring slot in RGB555 (NesPalette) so core1 converts and packs it along with the
+    // rest of the scanline.
+    if (g_osdFrames > 0 && line >= 16 && line < 24)
     {
-        char volStr[12];
-        int n = snprintf(volStr, sizeof(volStr), "VOL %d", settings.audioGain);
+        char osdStr[16];
+        int n;
+        if (g_osdKind == OSD_SYNC)
+        {
+            int t = settings.syncSpeedAdj, at = t < 0 ? -t : t; // tenths-of-us -> signed N.n
+            n = snprintf(osdStr, sizeof(osdStr), "SYNC %s%d.%d", t < 0 ? "-" : "", at / 10, at % 10);
+        }
+        else if (g_osdKind == OSD_PACE)
+            n = snprintf(osdStr, sizeof(osdStr), "PACE %d", settings.dmaPaceY);
+        else
+            n = snprintf(osdStr, sizeof(osdStr), "VOL %d", settings.audioGain);
         WORD fgc = NesPalette[48];
         WORD bgc = NesPalette[15];
-        WORD *p = currentLineBuffer_ + 40; // start column 40 (inside the NES area)
+        WORD *p = currentLineBuffer_ + 8; // ring slot: NES column 8
         int rowInChar = line % 8;
         for (int i = 0; i < n; i++)
         {
-            char slice = getcharslicefrom8x8font(volStr[i], rowInChar);
+            char slice = getcharslicefrom8x8font(osdStr[i], rowInChar);
             for (int bit = 0; bit < 8; bit++)
             {
                 *p++ = (slice & 1) ? fgc : bgc;
@@ -1548,8 +1763,7 @@ void __not_in_flash_func(InfoNES_PostDrawLine)(int line)
 #endif
         assert(currentLineBuffer_);
 #if USE_ST7789
-        st7789_convert_game_line(currentLineBuffer_); // RGB555->565 here on core0
-        st7789_ring_commit(line); // hand the rendered line to core1 for SPI DMA
+        st7789_ring_commit(line); // hand the raw line to core1 (it scales + streams it)
 #else
         dvi_->setLineBuffer(line, currentLineBuffer_);
 #endif
@@ -1601,7 +1815,13 @@ int main()
     romName = selectedRom;
     ErrorMessage[0] = selectedRom[0] = 0;
 
+#if USE_ST7789
+    // 292 MHz overclock for the wider 8:7 image needs a bit more core voltage than
+    // the 280 MHz builds use; 1.25 V gives stability margin (still well under max).
+    Frens::setClocksAndStartStdio(CPUFreqKHz, VREG_VOLTAGE_1_25);
+#else
     Frens::setClocksAndStartStdio(CPUFreqKHz, VREG_VOLTAGE_1_20);
+#endif
 
 #if USE_ST7789
     // Source clk_peri from clk_sys so the display SPI0 and the SD-card spi1 both
@@ -1667,6 +1887,19 @@ int main()
     // builds the panel is brought up earlier, before initAll.)
     st7789_init();
     gpio_buttons_init();
+    st7789ApplyPaletteSaturation(); // one-time gentle palette saturation boost
+    // Hand the real (saturated) palette to the driver as an index->RGB565 LUT, then switch
+    // NesPalette to identity so InfoNES, the NSF UI and the OSD overlays all write 1-byte
+    // palette INDICES into the ring (half the RAM of RGB555 => twice the scatter window).
+    st7789_set_palette((const uint16_t *)NesPalette, 64);
+    {
+        WORD *pal = (WORD *)NesPalette;
+        for (int i = 0; i < 64; i++)
+            pal[i] = (WORD)i; // backdrop pixels still get |0x8000 in PalTable (sprite priority)
+    }
+#if ST7789_USB_DEVICE
+    st7789_calibrate_spi(); // measure raw SPI throughput before core1 starts
+#endif
     st7789_start_display_core1(); // core1 drives the panel; idle until a game commits lines
 #endif
 #if USE_ST7789
@@ -1680,6 +1913,10 @@ int main()
 #endif
 
     scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
+#if USE_ST7789
+    st7789_set_scanlines(ST7789_SCANLINES_ON()); // apply scanlines + aspect per the saved screen mode
+    st7789_set_aspect(ST7789_ASPECT_1_1());
+#endif
     bool showSplash = true;
 #if PICO_RP2350
     g_settings_visibility_nes[MOPT_AUTO_SWAP_FDS_DISK] = 1;
@@ -1796,10 +2033,15 @@ int main()
             paceFrame(true); // reset pacing to avoid burst of frames if resetGame is true
 #if USE_ST7789
             st7789_fill(0x0000); // clear the static side bars to black (game sends only the 256 centre)
+            st7789_set_color_mode(true); // game streams 12-bit RGB444 (saves SPI/line vs the menu's 16-bit)
+            st7789_match_audio_clock();  // lock the I2S DAC rate to the (seam-parked) frame rate
+            st7789_set_dma_pace((uint16_t)settings.dmaPaceY); // apply the saved tear-angle pace
+
 #endif
             InfoNES_Main(region);
 #if USE_ST7789
             st7789_ring_flush(); // drain core1's in-flight lines before core0 redraws
+            st7789_set_color_mode(false); // back to 16-bit RGB565 for the menu
 #endif
 
         } while (resetGame);

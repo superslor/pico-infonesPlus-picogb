@@ -344,6 +344,11 @@ if(ST7789_USB_DEVICE)
     target_compile_definitions(${projectname} PRIVATE
         PICO_STDIO_USB_USE_DEFAULT_DESCRIPTORS=1
         PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=0
+        # NON-BLOCKING stdout: when no host is reading, the CDC FIFO fills and printf would
+        # otherwise SPIN until this timeout, stalling core0 once/sec (a visible seam "pulse").
+        # 0 => drop chars when the FIFO is full and return immediately. Diag lines still come
+        # through whenever a reader is attached (FIFO has space then).
+        PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
     )
 else()
     target_link_libraries(${projectname} PRIVATE tinyusb_host xinput_host)

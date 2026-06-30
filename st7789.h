@@ -5,9 +5,9 @@
  * DVI/HDMI video output so the NES emulator can run on the existing Pico-GB
  * physical build with no wiring changes.
  *
- * Geometry: the NES picture is 256x240. The panel is 320x240, so the image is
- * centered horizontally with 32px black bars on each side (ST7789_X_OFFSET).
- * No scaling is performed.
+ * Geometry: the NES picture is 256x240. It is horizontally scaled to ST7789_OUT_WIDTH
+ * (default 292 ≈ the NES 8:7 pixel aspect) by core1 as it streams each line, and
+ * centered on the 320x240 panel (ST7789_OUT_X_OFFSET black bars on each side).
  *
  * Pin map and SPI parameters match the Pico-GB "320 landscape" build
  * (pico1-gb-320): proven-correct init, MADCTL 0x60, INVOFF, mode 0, 70 MHz.
@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,8 +28,20 @@ extern "C" {
 /* ---- Panel geometry --------------------------------------------------- */
 #define ST7789_WIDTH      320u   /* panel width  (landscape) */
 #define ST7789_HEIGHT     240u   /* panel height (landscape) */
-#define ST7789_NES_WIDTH  256u   /* active NES picture width  */
+#define ST7789_NES_WIDTH  256u   /* active NES picture width (source) */
 #define ST7789_X_OFFSET   ((ST7789_WIDTH - ST7789_NES_WIDTH) / 2u)  /* = 32 */
+
+/* Game OUTPUT width: the 256-wide NES picture is horizontally scaled to this and
+ * centred on the panel. 256 = 1:1 (no scaling); 292 ≈ the NES 8:7 pixel aspect.
+ * The packed ring slots are this wide, so it directly sets the SPI bandwidth. */
+#ifndef ST7789_OUT_WIDTH
+#define ST7789_OUT_WIDTH  292u   /* 256 * 8/7 ≈ 292: the NES 8:7 pixel aspect ratio */
+#endif
+#define ST7789_OUT_X_OFFSET ((ST7789_WIDTH - ST7789_OUT_WIDTH) / 2u)
+
+/* 12-bit (RGB444) packed output: 2 pixels -> 3 bytes, so OUT_WIDTH pixels -> OUT_WORDS
+ * 16-bit words (OUT_WIDTH must be a multiple of 4). */
+#define ST7789_OUT_WORDS ((ST7789_OUT_WIDTH * 3u) / 4u)
 
 /* ---- Pin map (GP numbers) — overridable from the board config ---------- */
 #ifndef ST7789_SPI_PORT
@@ -53,11 +66,13 @@ extern "C" {
 #define ST7789_PIN_BL     22
 #endif
 
-/* SPI clock. 70 MHz is proven on this panel at a 280 MHz system clock
- * (clk_peri/4). The achieved rate depends on clk_peri; the driver requests
- * this and lets the PL022 pick the nearest divisor. */
+/* SPI clock REQUEST. The PL022 picks the fastest /2N divisor that does NOT exceed
+ * this, so the request must sit at/above the desired clk_peri/4 — otherwise the next
+ * divisor (clk_peri/6) is chosen and the bus runs far slower. At clk_peri=292 MHz,
+ * /4 = 73 MHz; requesting 70 would drop to /6 = 48.7 MHz. 75 MHz keeps /4 across our
+ * clocks: 280→70, 292→73, 300→75 (all under the panel's ~80 MHz limit). */
 #ifndef ST7789_SPI_BAUD
-#define ST7789_SPI_BAUD   (70u * 1000u * 1000u)
+#define ST7789_SPI_BAUD   (75u * 1000u * 1000u)
 #endif
 
 /*
@@ -69,6 +84,11 @@ void st7789_init(void);
 
 /* Fill the entire panel with a solid RGB565 colour (blocking). */
 void st7789_fill(uint16_t color);
+
+/* Switch the panel pixel format: false = 16-bit RGB565 (menu), true = 12-bit RGB444
+ * (game, packed — saves ~25% SPI/line). Call with the panel idle at game entry/exit. */
+void st7789_set_color_mode(bool twelve_bit);
+
 
 /*
  * Return one of two internal ping-pong line buffers, each ST7789_WIDTH (320)
@@ -89,25 +109,46 @@ uint16_t *st7789_next_linebuf(void);
 void st7789_send_line(int row, uint16_t *buf);
 
 /*
- * Game-optimized scanline: sends ONLY the 256 active pixels (buf + X_OFFSET) to
- * panel columns 32..287, skipping the static black side bars (which must be
- * pre-cleared once, e.g. via st7789_fill, before the game starts). Saves ~20% of
- * the per-frame SPI bandwidth vs the full-width path. Converts RGB555->RGB565 in
- * place like st7789_send_line. `buf` is the full 320-wide line buffer.
+ * Horizontally scale one rendered NES scanline (ST7789_NES_WIDTH=256 RGB555 source
+ * pixels at src[0]) to ST7789_OUT_WIDTH RGB565 output pixels at dst[0], using linear
+ * interpolation (the horizontal pass of bilinear), and strip InfoNES's 0x8000 backdrop
+ * flag. Run on CORE1 from the display loop, hidden under the per-line SPI DMA wait, so
+ * the 8:7 stretch costs the emulator (core0) nothing. NOTE: src[] is converted to
+ * RGB565 in place. st7789_init() builds the interpolation table.
  */
-void st7789_send_game_line(int row, uint16_t *buf);
+void st7789_scale_game_line(uint8_t *src, uint16_t *dst, bool darken, bool aspect_1_1);
 
-/*
- * Convert the 256 active centre pixels of a 320-wide line buffer from RGB555 to
- * the panel's RGB565 in place (and strip InfoNES's 0x8000 backdrop flag). Call
- * this on core0 just before st7789_ring_commit() so core1 only DMAs pixels.
- */
-void st7789_convert_game_line(uint16_t *buf);
+/* Hand the driver the real (saturated) NES palette so it can build its index->RGB565 LUT.
+ * The ring stores 1-byte palette INDICES (half the RAM of RGB555 => twice the scatter window);
+ * core1 expands index->color via this LUT. Call once after the palette is finalized and BEFORE
+ * NesPalette is switched to identity (so InfoNES/overlays write indices). pal = RGB555[n]. */
+void st7789_set_palette(const uint16_t *pal, int n);
+
+/* Select how core1 turns a committed slot into a panel line: false (default) =
+ * scale 256->OUT_WIDTH for games; true = NSF, whose UI is already laid out at the
+ * OUT_WIDTH panel columns, so core1 only converts RGB555->RGB565 (no scale). */
+void st7789_set_nsf_mode(bool on);
+
+/* Scanline mode: when on, core1 darkens odd output rows (CRT look). Cheap — ~free when off
+ * (no per-pixel work). Set from the screen mode at game start / on the in-game toggle. */
+void st7789_set_scanlines(bool on);
+
+/* Aspect mode: false = 8:7 (bilinear stretch), true = 1:1 (256 NES pixels centred with
+ * black bars, no scale). Set from the screen mode at game start / on the in-game toggle. */
+void st7789_set_aspect(bool one_to_one);
+
+/* Retune the per-line DMA pace at runtime (live tear-angle tuning). The DREQ word rate is
+ * clk_sys / y, so LARGER y = slower per-line write. Lowering y speeds the write (rotates the
+ * parked tear toward horizontal, where the sync pacer can slide it off the top edge); raising
+ * it slows the write (toward vertical) and eats core1 headroom. No effect if y is 0 (unpaced)
+ * at build time. Persisted as settings.dmaPaceY; applied at game start and on the live knob. */
+void st7789_set_dma_pace(uint16_t y);
 
 /* ---- core1 display offload ---------------------------------------------
  * Launch core1 (st7789_start_display_core1) once at startup. During a game the
- * emulator (core0) calls st7789_ring_acquire() to get a line buffer to render
- * into, then st7789_ring_commit(row) to hand it to core1 for the SPI DMA. Call
+ * emulator (core0) calls st7789_ring_acquire() to get a packed ST7789_OUT_WIDTH-wide
+ * line buffer to render into, then st7789_ring_commit(row) to hand it to core1.
+ * core1 batch-DMAs contiguous runs of committed scanlines to the panel. Call
  * st7789_ring_flush() before drawing on core0 again (e.g. returning to the menu)
  * so core1's in-flight transfers complete and the SPI bus is free. */
 void      st7789_start_display_core1(void);
@@ -119,15 +160,25 @@ void      st7789_ring_flush(void);
 void st7789_wait_idle(void);
 
 #if ST7789_USB_DEVICE
-/* DIAG (serial-diagnostics build only): time (us) core1 took to transfer the last
- * full game frame. Compare to 16667 us; if it exceeds that, the display is the
- * 60fps bottleneck. */
+/* DIAG (serial-diagnostics build only): period (us) of the last displayed frame
+ * (first-line to first-line; ~16667 when paced to 60fps). */
 extern volatile uint32_t st7789_last_frame_us;
 
-/* DIAG: free-running total of microseconds core1 spent busy pushing pixels.
- * Sample the delta over one second: ~1,000,000 means core1 is saturated (the
- * display is the bottleneck); well below means core0 emulation is. */
-extern volatile uint32_t st7789_core1_busy_us;
+/* DIAG: free-running total of microseconds core1 spent IDLE waiting for core0.
+ * The true display-active time per second = 1,000,000 - (idle delta over 1 s);
+ * the smaller that active figure, the more headroom the display has. */
+extern volatile uint32_t st7789_core1_idle_us;
+
+/* DIAG: us core0 spent blocked in ring_acquire (ring full). Large => the display
+ * (core1) is the bottleneck (decoupling/ping-pong can help); ~0 => emulation is. */
+extern volatile uint32_t st7789_acquire_block_us;
+
+/* DIAG: us for one gap-free contiguous DMA burst (raw SPI throughput, no per-line
+ * setup). Call once before launching core1. st7789_calib_us holds the result. */
+void st7789_calibrate_spi(void);
+extern volatile uint32_t st7789_calib_us;
+extern volatile uint32_t st7789_calib_clkperi; /* clk_peri Hz */
+extern volatile uint32_t st7789_calib_baud;    /* achieved SPI bit clock Hz */
 #endif
 
 #ifdef __cplusplus

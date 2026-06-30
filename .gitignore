@@ -396,3 +396,8 @@ MigrationBackup/
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
 /.github/chatmodes/
+
+# --- Pico-GB backup additions (build-host dir + large regenerable debug elfs) ---
+**/build-host
+build-host/
+releases/*.elf
