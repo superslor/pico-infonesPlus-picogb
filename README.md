@@ -40,6 +40,9 @@ pacer, while scaling the 256-wide NES picture to the NES **8:7 pixel aspect with
 interpolation — all at a locked **60 fps**. The scaler, scatter, and SPI DMA run on core 1; the
 emulator runs on core 0.
 
+See **[docs/anti-tearing.md](docs/anti-tearing.md)** for why the tear can't be dissolved on this panel
+and why golden64 (scatter) was chosen over the clean-parked-line alternative.
+
 ## Firmware
 
 Pre-built `.uf2` files are in **[`firmware/`](firmware/)**:
