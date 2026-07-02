@@ -72,15 +72,19 @@ Requires the [Pico SDK](https://github.com/raspberrypi/pico-sdk) (`PICO_SDK_PATH
 
 ```sh
 # Shipping build (USB controller as Player 2):
-cmake -B build -S . -DHW_CONFIG=20 -DPICO_PLATFORM=rp2040 -DUSE_ST7789=1 -DST7789_USB_SERIAL=0
+cmake -B build -S . -DPICO_BOARD=pico -DPICO_PLATFORM=rp2040 -DCMAKE_BUILD_TYPE=Release \
+      -DHW_CONFIG=20 -DUSE_ST7789=1 -DST7789_USB_SERIAL=0
 cmake --build build -j
 
 # Diagnostics build (USB CDC serial instead of the controller):
-cmake -B build -S . -DHW_CONFIG=20 -DPICO_PLATFORM=rp2040 -DUSE_ST7789=1 -DST7789_USB_SERIAL=1
+cmake -B build -S . -DPICO_BOARD=pico -DPICO_PLATFORM=rp2040 -DCMAKE_BUILD_TYPE=Release \
+      -DHW_CONFIG=20 -DUSE_ST7789=1 -DST7789_USB_SERIAL=1
 cmake --build build -j
 ```
 
-The firmware is written to `build/piconesPlus.uf2`.
+`-DPICO_BOARD=pico` is required — without it the Pico SDK defaults to `pico2` (RP2350) and
+configuration fails, since this firmware targets the RP2040. The firmware is written to
+`build/piconesPlus.uf2`. (A convenience wrapper `./bld.sh` sets these flags for you.)
 
 ## Credits
 

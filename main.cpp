@@ -86,6 +86,8 @@ static int g_osdKind = OSD_VOL;
 #define ST7789_SYNC_ADJ_MIN (-20000)  /* tenths-of-us; wide enough to re-park after an FRCTRL2 line-rate change */
 #define ST7789_SYNC_ADJ_MAX (8000)
 #define ST7789_SYNC_ADJ_STEP (1)       /* fine parking step = 1 tenth = 0.1us per press (SELECT+B+L/R) */
+#define ST7789_SYNC_ADJ_COARSE (100)   /* coarse parking step = 100 tenths = 10us per press (SELECT+B+UP/DOWN):
+                                        * jump into the parked ballpark fast, then dial in with the fine B+L/R knob. */
 
 // In-game per-line DMA pace range (tear-angle knob, SELECT+A+L/R). clk_sys/y word rate, so
 // smaller y = faster write = toward horizontal. Bounded: below ~70 pacing stops mattering
@@ -616,14 +618,38 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
             if (pushed & UP)
             {
 #if USE_ST7789
-                scaleMode8_7_ = st7789_cycle_screen_mode(+1); // SELECT+UP: forward through the cycle order
+                if (i == 0 && (v & B)) // SELECT+B+UP = COARSE sync faster (10us) — get into the parked ballpark
+                {
+                    if (!g_syncBUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::B; g_syncBUsed[i] = true; }
+                    settings.syncSpeedAdj += ST7789_SYNC_ADJ_COARSE;
+                    if (settings.syncSpeedAdj > ST7789_SYNC_ADJ_MAX) settings.syncSpeedAdj = ST7789_SYNC_ADJ_MAX;
+                    st7789_match_audio_clock();
+                    g_osdKind = OSD_SYNC;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
+                    printf("syncSpeedAdj: %d (coarse)\n", settings.syncSpeedAdj);
+                }
+                else
+                    scaleMode8_7_ = st7789_cycle_screen_mode(+1); // SELECT+UP: forward through the cycle order
 #else
                 scaleMode8_7_ = Frens::screenMode(-1);
 #endif
             } else if (pushed & DOWN)
             {
 #if USE_ST7789
-                scaleMode8_7_ = st7789_cycle_screen_mode(-1); // SELECT+DOWN: backward through the cycle order
+                if (i == 0 && (v & B)) // SELECT+B+DOWN = COARSE sync slower (10us)
+                {
+                    if (!g_syncBUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::B; g_syncBUsed[i] = true; }
+                    settings.syncSpeedAdj -= ST7789_SYNC_ADJ_COARSE;
+                    if (settings.syncSpeedAdj < ST7789_SYNC_ADJ_MIN) settings.syncSpeedAdj = ST7789_SYNC_ADJ_MIN;
+                    st7789_match_audio_clock();
+                    g_osdKind = OSD_SYNC;
+                    g_osdFrames = ST7789_OSD_FRAMES;
+                    g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
+                    printf("syncSpeedAdj: %d (coarse)\n", settings.syncSpeedAdj);
+                }
+                else
+                    scaleMode8_7_ = st7789_cycle_screen_mode(-1); // SELECT+DOWN: backward through the cycle order
 #else
                 scaleMode8_7_ = Frens::screenMode(+1);
 #endif
@@ -640,7 +666,7 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
                     g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
                     printf("dmaPaceY: %d\n", settings.dmaPaceY);
                 }
-                else if (i == 0 && (v & B)) // SELECT+B+LEFT = sync SLOWER (coarse 10us), park the seam
+                else if (i == 0 && (v & B)) // SELECT+B+LEFT = FINE sync slower (0.1us), park the seam
                 {
                     if (!g_syncBUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::B; g_syncBUsed[i] = true; } // cancel the B-press rapid-fire toggle
                     settings.syncSpeedAdj -= ST7789_SYNC_ADJ_STEP;
@@ -693,7 +719,7 @@ void InfoNES_PadState(DWORD *pdwPad1, DWORD *pdwPad2, DWORD *pdwSystem)
                     g_osdSaveCountdown = ST7789_OSD_SAVE_FRAMES;
                     printf("dmaPaceY: %d\n", settings.dmaPaceY);
                 }
-                else if (i == 0 && (v & B)) // SELECT+B+RIGHT = sync FASTER (coarse 10us), park the seam
+                else if (i == 0 && (v & B)) // SELECT+B+RIGHT = FINE sync faster (0.1us), park the seam
                 {
                     if (!g_syncBUsed[i]) { rapidFireMask[i] ^= io::GamePadState::Button::B; g_syncBUsed[i] = true; } // cancel the B-press rapid-fire toggle
                     settings.syncSpeedAdj += ST7789_SYNC_ADJ_STEP;
